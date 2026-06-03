@@ -249,6 +249,10 @@ def compute_indicators_and_signals(df, state):
 # ==========================================
 def background_loop(state):
     while True:
+        # Always fetch data so the chart updates even if bot is OFF
+        df = fetch_data(state)
+        has_position = False
+
         if state.is_running:
             update_account_info(state)
 
@@ -272,19 +276,20 @@ def background_loop(state):
             else:
                 has_position = False
 
-            df = fetch_data(state)
-            if df is not None and not df.empty and len(df) >= state.ema_period + 1:
-                # Ensure 'close' is numeric
-                df['close'] = pd.to_numeric(df['close'], errors='coerce')
-                df['high'] = pd.to_numeric(df['high'], errors='coerce')
-                df['low'] = pd.to_numeric(df['low'], errors='coerce')
+        if df is not None and not df.empty and len(df) >= state.ema_period + 1:
+            # Ensure 'close' is numeric
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
 
-                df.dropna(subset=['close', 'high', 'low'], inplace=True)
+            df.dropna(subset=['close', 'high', 'low'], inplace=True)
 
-                if len(df) >= state.ema_period + 1:
-                    df = compute_indicators_and_signals(df, state)
-                    state.df_latest = df
+            if len(df) >= state.ema_period + 1:
+                df = compute_indicators_and_signals(df, state)
+                state.df_latest = df
 
+                # Trading Logic (only execute if running)
+                if state.is_running:
                     latest = df.iloc[-1]
 
                     if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
@@ -299,7 +304,6 @@ def background_loop(state):
                                 tp = latest['close'] - (state.atr_tp * latest['ATR'])
                                 execute_trade(state, "SELL", latest['close'], sl, tp, latest['time'])
 
-        # Background loop runs slightly faster now to ensure freshness for 1M
         time.sleep(10)
 
 @st.cache_resource
@@ -351,7 +355,7 @@ st.write(f"**Current Mode:** {mode_text} | **Timeframe:** {bot_state.timeframe}"
 is_on = st.toggle("Bot Status (ON/OFF)", value=bot_state.is_running)
 bot_state.is_running = is_on
 
-# Active Parameter Dashboard
+# Active Parameter Dashboard (Static / Outer Scope)
 st.subheader("Active Parameter Dashboard")
 pcol1, pcol2, pcol3, pcol4 = st.columns(4)
 with pcol1:
@@ -365,83 +369,85 @@ with pcol4:
 
 st.markdown("---")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Account Balance", bot_state.balance)
-with col2:
-    st.metric("Active Positions", bot_state.positions)
-with col3:
-    st.metric("Last Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+# Dynamic Fragment for Data and Chart rendering
+@st.fragment(run_every="10s")
+def render_dynamic_dashboard(state):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Account Balance", state.balance)
+    with col2:
+        st.metric("Active Positions", state.positions)
+    with col3:
+        st.metric("Last Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-# Chart Rendering
-st.subheader("Live USD/JPY Chart")
-if bot_state.df_latest is not None and not bot_state.df_latest.empty:
-    df_plot = bot_state.df_latest.tail(150) # Show last 150 candles
+    # Chart Rendering
+    st.subheader("Live USD/JPY Chart")
+    if state.df_latest is not None and not state.df_latest.empty:
+        df_plot = state.df_latest.tail(150) # Show last 150 candles
 
-    fig = go.Figure()
+        fig = go.Figure()
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df_plot['time'],
-        open=df_plot['open'],
-        high=df_plot['high'],
-        low=df_plot['low'],
-        close=df_plot['close'],
-        name="Price"
-    ))
-
-    # EMA
-    if 'EMA' in df_plot.columns:
-        fig.add_trace(go.Scatter(
+        # Candlestick
+        fig.add_trace(go.Candlestick(
             x=df_plot['time'],
-            y=df_plot['EMA'],
-            mode='lines',
-            line=dict(color='blue', width=2),
-            name=f'{bot_state.ema_period} EMA'
+            open=df_plot['open'],
+            high=df_plot['high'],
+            low=df_plot['low'],
+            close=df_plot['close'],
+            name="Price"
         ))
 
-    # Signals
-    buy_signals = df_plot[df_plot['BUY_SIGNAL'] == True]
-    if not buy_signals.empty:
-        fig.add_trace(go.Scatter(
-            x=buy_signals['time'],
-            y=buy_signals['low'] - (buy_signals['ATR'] * 0.5), # Offset below candle
-            mode='markers',
-            marker=dict(symbol='triangle-up', color='green', size=15),
-            name='BUY Signal'
-        ))
+        # EMA
+        if 'EMA' in df_plot.columns:
+            fig.add_trace(go.Scatter(
+                x=df_plot['time'],
+                y=df_plot['EMA'],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=f'{state.ema_period} EMA'
+            ))
 
-    sell_signals = df_plot[df_plot['SELL_SIGNAL'] == True]
-    if not sell_signals.empty:
-        fig.add_trace(go.Scatter(
-            x=sell_signals['time'],
-            y=sell_signals['high'] + (sell_signals['ATR'] * 0.5), # Offset above candle
-            mode='markers',
-            marker=dict(symbol='triangle-down', color='red', size=15),
-            name='SELL Signal'
-        ))
+        # Signals
+        buy_signals = df_plot[df_plot['BUY_SIGNAL'] == True]
+        if not buy_signals.empty:
+            fig.add_trace(go.Scatter(
+                x=buy_signals['time'],
+                y=buy_signals['low'] - (buy_signals['ATR'] * 0.5), # Offset below candle
+                mode='markers',
+                marker=dict(symbol='triangle-up', color='green', size=15),
+                name='BUY Signal'
+            ))
 
-    fig.update_layout(
-        title="USD/JPY Price Action with Signals",
-        yaxis_title="Price",
-        xaxis_title="Time",
-        template="plotly_dark",
-        height=600,
-        xaxis_rangeslider_visible=False
-    )
+        sell_signals = df_plot[df_plot['SELL_SIGNAL'] == True]
+        if not sell_signals.empty:
+            fig.add_trace(go.Scatter(
+                x=sell_signals['time'],
+                y=sell_signals['high'] + (sell_signals['ATR'] * 0.5), # Offset above candle
+                mode='markers',
+                marker=dict(symbol='triangle-down', color='red', size=15),
+                name='SELL Signal'
+            ))
 
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("Waiting for data to populate the chart. Make sure 'Bot Status' is ON.")
+        fig.update_layout(
+            title="USD/JPY Price Action with Signals",
+            yaxis_title="Price",
+            xaxis_title="Time",
+            template="plotly_dark",
+            height=600,
+            xaxis_rangeslider_visible=False
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Waiting for data to populate the chart. Make sure 'Bot Status' is ON (or wait for the first fetch).")
 
 
-st.subheader("Recent Trade Logs")
-log_df = pd.DataFrame(bot_state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
-if log_df.empty:
-    st.write("No trades yet.")
-else:
-    st.dataframe(log_df, use_container_width=True)
+    st.subheader("Recent Trade Logs")
+    log_df = pd.DataFrame(state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
+    if log_df.empty:
+        st.write("No trades yet.")
+    else:
+        st.dataframe(log_df, use_container_width=True)
 
-# Auto-refresh loop to ensure UI updates every 10 seconds without manual interaction
-time.sleep(10)
-st.rerun()
+# Run the fragment
+render_dynamic_dashboard(bot_state)
