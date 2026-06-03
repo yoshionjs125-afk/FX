@@ -18,6 +18,7 @@ class BotState:
         self.oanda_api_token = ""
         self.env = "Practice"
         self.webhook_url = ""
+        self.timeframe = "1 Hour"
         self.ema_period = 200
         self.rsi_buy = 60
         self.rsi_sell = 40
@@ -71,10 +72,15 @@ def update_account_info(state):
         print(f"Error fetching account info: {e}")
 
 def fetch_data(state):
+    # Determine intervals based on timeframe setting
+    yf_interval = "1m" if state.timeframe == "1 Minute" else "1h"
+    yf_period = "1d" if state.timeframe == "1 Minute" else "30d"
+    oanda_granularity = "M1" if state.timeframe == "1 Minute" else "H1"
+
     # Data Fetching Fallback: use yfinance if OANDA credentials are empty
     if not state.oanda_account_id or not state.oanda_api_token:
         try:
-            df = yf.download("JPY=X", interval="1h", period="30d", progress=False)
+            df = yf.download("JPY=X", interval=yf_interval, period=yf_period, progress=False)
             if df.empty:
                 return None
 
@@ -96,7 +102,7 @@ def fetch_data(state):
             return None
 
     # OANDA Data Fetching
-    url = f"{get_oanda_url(state.env)}/instruments/USD_JPY/candles?count=300&price=M&granularity=H1"
+    url = f"{get_oanda_url(state.env)}/instruments/USD_JPY/candles?count=300&price=M&granularity={oanda_granularity}"
     headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
     try:
         response = requests.get(url, headers=headers)
@@ -293,7 +299,8 @@ def background_loop(state):
                                 tp = latest['close'] - (state.atr_tp * latest['ATR'])
                                 execute_trade(state, "SELL", latest['close'], sl, tp, latest['time'])
 
-        time.sleep(60)
+        # Background loop runs slightly faster now to ensure freshness for 1M
+        time.sleep(10)
 
 @st.cache_resource
 def start_background_thread():
@@ -319,6 +326,10 @@ bot_state.env = st.sidebar.radio("Environment", ["Practice", "Live"], index=0 if
 bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
 
 st.sidebar.header("Strategy Parameters")
+# Add timeframe selection
+timeframe_index = 0 if bot_state.timeframe == "1 Hour" else 1
+bot_state.timeframe = st.sidebar.selectbox("Timeframe", ["1 Hour", "1 Minute"], index=timeframe_index)
+
 bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=50, max_value=300, value=bot_state.ema_period)
 bot_state.rsi_buy = st.sidebar.slider("RSI Buy Max Level", 0, 100, bot_state.rsi_buy)
 bot_state.rsi_sell = st.sidebar.slider("RSI Sell Min Level", 0, 100, bot_state.rsi_sell)
@@ -335,7 +346,7 @@ bot_state.atr_tp = st.sidebar.slider("ATR Take Profit Multiplier", 1.0, 10.0, bo
 st.title("FX Trading Bot - USD/JPY")
 
 mode_text = "Live Trading Mode" if bot_state.oanda_account_id and bot_state.oanda_api_token else "Notification-Only Mode"
-st.write(f"**Current Mode:** {mode_text}")
+st.write(f"**Current Mode:** {mode_text} | **Timeframe:** {bot_state.timeframe}")
 
 is_on = st.toggle("Bot Status (ON/OFF)", value=bot_state.is_running)
 bot_state.is_running = is_on
@@ -430,3 +441,7 @@ if log_df.empty:
     st.write("No trades yet.")
 else:
     st.dataframe(log_df, use_container_width=True)
+
+# Auto-refresh loop to ensure UI updates every 10 seconds without manual interaction
+time.sleep(10)
+st.rerun()
