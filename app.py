@@ -6,6 +6,7 @@ import yfinance as yf
 import time
 import threading
 from datetime import datetime
+import plotly.graph_objects as go
 
 # ==========================================
 # State Management
@@ -30,6 +31,7 @@ class BotState:
         self.positions = "---"
         self.last_trade_time = None
         self.has_position_last_check = False
+        self.df_latest = None
 
 @st.cache_resource
 def get_global_state():
@@ -105,7 +107,7 @@ def fetch_data(state):
             for c in candles:
                 if c['complete']:
                     records.append({
-                        'time': c['time'],
+                        'time': pd.to_datetime(c['time']),
                         'open': float(c['mid']['o']),
                         'high': float(c['mid']['h']),
                         'low': float(c['mid']['l']),
@@ -205,12 +207,43 @@ def execute_trade(state, action, price, sl, tp, candle_time):
     except Exception as e:
         print(f"Execution error: {e}")
 
+def compute_indicators_and_signals(df, state):
+    df['EMA'] = ta.ema(df['close'], length=state.ema_period)
+    macd = ta.macd(df['close'], fast=state.macd_fast, slow=state.macd_slow, signal=state.macd_signal)
+    if macd is not None and not macd.empty:
+        df['MACD'] = macd.iloc[:, 0]
+        df['MACD_Signal'] = macd.iloc[:, 2]
+
+    df['RSI'] = ta.rsi(df['close'], length=14)
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+
+    # Pre-compute signals for charting
+    df['BUY_SIGNAL'] = False
+    df['SELL_SIGNAL'] = False
+
+    for i in range(1, len(df)):
+        prev = df.iloc[i-1]
+        curr = df.iloc[i]
+
+        if pd.isna(curr['EMA']) or pd.isna(curr['ATR']) or pd.isna(curr['RSI']) or 'MACD' not in df.columns:
+            continue
+
+        macd_crossed_above = prev['MACD'] <= prev['MACD_Signal'] and curr['MACD'] > curr['MACD_Signal']
+        macd_crossed_below = prev['MACD'] >= prev['MACD_Signal'] and curr['MACD'] < curr['MACD_Signal']
+
+        if curr['close'] > curr['EMA'] and curr['RSI'] < state.rsi_buy and macd_crossed_above:
+            df.at[df.index[i], 'BUY_SIGNAL'] = True
+        elif curr['close'] < curr['EMA'] and curr['RSI'] > state.rsi_sell and macd_crossed_below:
+            df.at[df.index[i], 'SELL_SIGNAL'] = True
+
+    return df
+
 # ==========================================
 # Background Loop Setup
 # ==========================================
 def background_loop(state):
     while True:
-        if state.is_running: # Removed OANDA credentials requirement here
+        if state.is_running:
             update_account_info(state)
 
             # Check for position closures (Only relevant if OANDA credentials exist)
@@ -243,34 +276,22 @@ def background_loop(state):
                 df.dropna(subset=['close', 'high', 'low'], inplace=True)
 
                 if len(df) >= state.ema_period + 1:
-                    df['EMA'] = ta.ema(df['close'], length=state.ema_period)
-                    macd = ta.macd(df['close'], fast=state.macd_fast, slow=state.macd_slow, signal=state.macd_signal)
-                    if macd is not None and not macd.empty:
-                        df['MACD'] = macd.iloc[:, 0]
-                        df['MACD_Signal'] = macd.iloc[:, 2]
-
-                    df['RSI'] = ta.rsi(df['close'], length=14)
-                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    df = compute_indicators_and_signals(df, state)
+                    state.df_latest = df
 
                     latest = df.iloc[-1]
-                    prev = df.iloc[-2]
 
                     if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
                         if not has_position and latest['time'] != state.last_trade_time:
-                            macd_crossed_above = prev['MACD'] <= prev['MACD_Signal'] and latest['MACD'] > latest['MACD_Signal']
-                            macd_crossed_below = prev['MACD'] >= prev['MACD_Signal'] and latest['MACD'] < latest['MACD_Signal']
+                            if latest['BUY_SIGNAL']:
+                                sl = latest['close'] - (state.atr_sl * latest['ATR'])
+                                tp = latest['close'] + (state.atr_tp * latest['ATR'])
+                                execute_trade(state, "BUY", latest['close'], sl, tp, latest['time'])
 
-                            current_price = latest['close']
-
-                            if current_price > latest['EMA'] and latest['RSI'] < state.rsi_buy and macd_crossed_above:
-                                sl = current_price - (state.atr_sl * latest['ATR'])
-                                tp = current_price + (state.atr_tp * latest['ATR'])
-                                execute_trade(state, "BUY", current_price, sl, tp, latest['time'])
-
-                            elif current_price < latest['EMA'] and latest['RSI'] > state.rsi_sell and macd_crossed_below:
-                                sl = current_price + (state.atr_sl * latest['ATR'])
-                                tp = current_price - (state.atr_tp * latest['ATR'])
-                                execute_trade(state, "SELL", current_price, sl, tp, latest['time'])
+                            elif latest['SELL_SIGNAL']:
+                                sl = latest['close'] + (state.atr_sl * latest['ATR'])
+                                tp = latest['close'] - (state.atr_tp * latest['ATR'])
+                                execute_trade(state, "SELL", latest['close'], sl, tp, latest['time'])
 
         time.sleep(60)
 
@@ -319,6 +340,20 @@ st.write(f"**Current Mode:** {mode_text}")
 is_on = st.toggle("Bot Status (ON/OFF)", value=bot_state.is_running)
 bot_state.is_running = is_on
 
+# Active Parameter Dashboard
+st.subheader("Active Parameter Dashboard")
+pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+with pcol1:
+    st.metric("EMA Period", bot_state.ema_period)
+with pcol2:
+    st.metric("RSI Buy / Sell", f"{bot_state.rsi_buy} / {bot_state.rsi_sell}")
+with pcol3:
+    st.metric("MACD (F/S/Sig)", f"{bot_state.macd_fast}/{bot_state.macd_slow}/{bot_state.macd_signal}")
+with pcol4:
+    st.metric("ATR (SL / TP)", f"{bot_state.atr_sl}x / {bot_state.atr_tp}x")
+
+st.markdown("---")
+
 col1, col2, col3 = st.columns(3)
 with col1:
     st.metric("Account Balance", bot_state.balance)
@@ -326,6 +361,68 @@ with col2:
     st.metric("Active Positions", bot_state.positions)
 with col3:
     st.metric("Last Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+# Chart Rendering
+st.subheader("Live USD/JPY Chart")
+if bot_state.df_latest is not None and not bot_state.df_latest.empty:
+    df_plot = bot_state.df_latest.tail(150) # Show last 150 candles
+
+    fig = go.Figure()
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df_plot['time'],
+        open=df_plot['open'],
+        high=df_plot['high'],
+        low=df_plot['low'],
+        close=df_plot['close'],
+        name="Price"
+    ))
+
+    # EMA
+    if 'EMA' in df_plot.columns:
+        fig.add_trace(go.Scatter(
+            x=df_plot['time'],
+            y=df_plot['EMA'],
+            mode='lines',
+            line=dict(color='blue', width=2),
+            name=f'{bot_state.ema_period} EMA'
+        ))
+
+    # Signals
+    buy_signals = df_plot[df_plot['BUY_SIGNAL'] == True]
+    if not buy_signals.empty:
+        fig.add_trace(go.Scatter(
+            x=buy_signals['time'],
+            y=buy_signals['low'] - (buy_signals['ATR'] * 0.5), # Offset below candle
+            mode='markers',
+            marker=dict(symbol='triangle-up', color='green', size=15),
+            name='BUY Signal'
+        ))
+
+    sell_signals = df_plot[df_plot['SELL_SIGNAL'] == True]
+    if not sell_signals.empty:
+        fig.add_trace(go.Scatter(
+            x=sell_signals['time'],
+            y=sell_signals['high'] + (sell_signals['ATR'] * 0.5), # Offset above candle
+            mode='markers',
+            marker=dict(symbol='triangle-down', color='red', size=15),
+            name='SELL Signal'
+        ))
+
+    fig.update_layout(
+        title="USD/JPY Price Action with Signals",
+        yaxis_title="Price",
+        xaxis_title="Time",
+        template="plotly_dark",
+        height=600,
+        xaxis_rangeslider_visible=False
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Waiting for data to populate the chart. Make sure 'Bot Status' is ON.")
+
 
 st.subheader("Recent Trade Logs")
 log_df = pd.DataFrame(bot_state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
