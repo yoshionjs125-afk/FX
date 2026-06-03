@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import pandas_ta as ta
 import requests
+import yfinance as yf
 import time
 import threading
 from datetime import datetime
@@ -53,6 +54,8 @@ def send_webhook(webhook_url, message):
 
 def update_account_info(state):
     if not state.oanda_account_id or not state.oanda_api_token:
+        state.balance = "N/A (Notification Mode)"
+        state.positions = "N/A"
         return
     url = f"{get_oanda_url(state.env)}/accounts/{state.oanda_account_id}"
     headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
@@ -66,6 +69,31 @@ def update_account_info(state):
         print(f"Error fetching account info: {e}")
 
 def fetch_data(state):
+    # Data Fetching Fallback: use yfinance if OANDA credentials are empty
+    if not state.oanda_account_id or not state.oanda_api_token:
+        try:
+            df = yf.download("JPY=X", interval="1h", period="30d", progress=False)
+            if df.empty:
+                return None
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0] for col in df.columns]
+
+            # Rename columns to match the OANDA logic
+            df.reset_index(inplace=True)
+            df.rename(columns={
+                'Datetime': 'time',
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close'
+            }, inplace=True)
+            return df
+        except Exception as e:
+            print(f"Error fetching yfinance data: {e}")
+            return None
+
+    # OANDA Data Fetching
     url = f"{get_oanda_url(state.env)}/instruments/USD_JPY/candles?count=300&price=M&granularity=H1"
     headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
     try:
@@ -85,10 +113,14 @@ def fetch_data(state):
                     })
             return pd.DataFrame(records)
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"Error fetching data from OANDA: {e}")
     return None
 
 def check_open_positions(state):
+    # Return False if Notification-Only Mode
+    if not state.oanda_account_id or not state.oanda_api_token:
+        return False
+
     url = f"{get_oanda_url(state.env)}/accounts/{state.oanda_account_id}/positions/USD_JPY"
     headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
     try:
@@ -105,6 +137,24 @@ def check_open_positions(state):
     return False
 
 def execute_trade(state, action, price, sl, tp, candle_time):
+    # Notification-Only Mode check
+    if not state.oanda_account_id or not state.oanda_api_token:
+        log_entry = {
+            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Action": f"SIGNAL: {action}",
+            "Price": round(price, 3),
+            "SL": round(sl, 3),
+            "TP": round(tp, 3),
+            "Status": "Alert Sent"
+        }
+        state.logs.insert(0, log_entry)
+
+        msg = f"🔥 [SIGNAL ALERT] USD/JPY {action} Signal triggered at {price:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+        send_webhook(state.webhook_url, msg)
+        state.last_trade_time = candle_time
+        return
+
+    # Live Trading Mode
     units = 10000 if action == "BUY" else -10000
 
     order_payload = {
@@ -160,56 +210,67 @@ def execute_trade(state, action, price, sl, tp, candle_time):
 # ==========================================
 def background_loop(state):
     while True:
-        if state.is_running and state.oanda_account_id and state.oanda_api_token:
+        if state.is_running: # Removed OANDA credentials requirement here
             update_account_info(state)
 
-            # Check for position closures
-            has_position = check_open_positions(state)
-            if state.has_position_last_check and not has_position:
-                # Position was closed since last check
-                send_webhook(state.webhook_url, "POSITION CLOSED for USD/JPY.")
-                log_entry = {
-                    "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Action": "CLOSED",
-                    "Price": 0.0,
-                    "SL": 0.0,
-                    "TP": 0.0,
-                    "Status": "N/A"
-                }
-                state.logs.insert(0, log_entry)
+            # Check for position closures (Only relevant if OANDA credentials exist)
+            if state.oanda_account_id and state.oanda_api_token:
+                has_position = check_open_positions(state)
+                if state.has_position_last_check and not has_position:
+                    # Position was closed since last check
+                    send_webhook(state.webhook_url, "POSITION CLOSED for USD/JPY.")
+                    log_entry = {
+                        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Action": "CLOSED",
+                        "Price": 0.0,
+                        "SL": 0.0,
+                        "TP": 0.0,
+                        "Status": "N/A"
+                    }
+                    state.logs.insert(0, log_entry)
 
-            state.has_position_last_check = has_position
+                state.has_position_last_check = has_position
+            else:
+                has_position = False
 
             df = fetch_data(state)
             if df is not None and not df.empty and len(df) >= state.ema_period + 1:
-                df['EMA'] = ta.ema(df['close'], length=state.ema_period)
-                macd = ta.macd(df['close'], fast=state.macd_fast, slow=state.macd_slow, signal=state.macd_signal)
-                if macd is not None and not macd.empty:
-                    df['MACD'] = macd.iloc[:, 0]
-                    df['MACD_Signal'] = macd.iloc[:, 2]
+                # Ensure 'close' is numeric
+                df['close'] = pd.to_numeric(df['close'], errors='coerce')
+                df['high'] = pd.to_numeric(df['high'], errors='coerce')
+                df['low'] = pd.to_numeric(df['low'], errors='coerce')
 
-                df['RSI'] = ta.rsi(df['close'], length=14)
-                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                df.dropna(subset=['close', 'high', 'low'], inplace=True)
 
-                latest = df.iloc[-1]
-                prev = df.iloc[-2]
+                if len(df) >= state.ema_period + 1:
+                    df['EMA'] = ta.ema(df['close'], length=state.ema_period)
+                    macd = ta.macd(df['close'], fast=state.macd_fast, slow=state.macd_slow, signal=state.macd_signal)
+                    if macd is not None and not macd.empty:
+                        df['MACD'] = macd.iloc[:, 0]
+                        df['MACD_Signal'] = macd.iloc[:, 2]
 
-                if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
-                    if not has_position and latest['time'] != state.last_trade_time:
-                        macd_crossed_above = prev['MACD'] <= prev['MACD_Signal'] and latest['MACD'] > latest['MACD_Signal']
-                        macd_crossed_below = prev['MACD'] >= prev['MACD_Signal'] and latest['MACD'] < latest['MACD_Signal']
+                    df['RSI'] = ta.rsi(df['close'], length=14)
+                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
 
-                        current_price = latest['close']
+                    latest = df.iloc[-1]
+                    prev = df.iloc[-2]
 
-                        if current_price > latest['EMA'] and latest['RSI'] < state.rsi_buy and macd_crossed_above:
-                            sl = current_price - (state.atr_sl * latest['ATR'])
-                            tp = current_price + (state.atr_tp * latest['ATR'])
-                            execute_trade(state, "BUY", current_price, sl, tp, latest['time'])
+                    if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
+                        if not has_position and latest['time'] != state.last_trade_time:
+                            macd_crossed_above = prev['MACD'] <= prev['MACD_Signal'] and latest['MACD'] > latest['MACD_Signal']
+                            macd_crossed_below = prev['MACD'] >= prev['MACD_Signal'] and latest['MACD'] < latest['MACD_Signal']
 
-                        elif current_price < latest['EMA'] and latest['RSI'] > state.rsi_sell and macd_crossed_below:
-                            sl = current_price + (state.atr_sl * latest['ATR'])
-                            tp = current_price - (state.atr_tp * latest['ATR'])
-                            execute_trade(state, "SELL", current_price, sl, tp, latest['time'])
+                            current_price = latest['close']
+
+                            if current_price > latest['EMA'] and latest['RSI'] < state.rsi_buy and macd_crossed_above:
+                                sl = current_price - (state.atr_sl * latest['ATR'])
+                                tp = current_price + (state.atr_tp * latest['ATR'])
+                                execute_trade(state, "BUY", current_price, sl, tp, latest['time'])
+
+                            elif current_price < latest['EMA'] and latest['RSI'] > state.rsi_sell and macd_crossed_below:
+                                sl = current_price + (state.atr_sl * latest['ATR'])
+                                tp = current_price - (state.atr_tp * latest['ATR'])
+                                execute_trade(state, "SELL", current_price, sl, tp, latest['time'])
 
         time.sleep(60)
 
@@ -231,8 +292,8 @@ start_background_thread()
 st.set_page_config(page_title="FX Trading Bot Dashboard", layout="wide")
 
 st.sidebar.header("API Configuration")
-bot_state.oanda_account_id = st.sidebar.text_input("OANDA Account ID", value=bot_state.oanda_account_id)
-bot_state.oanda_api_token = st.sidebar.text_input("OANDA API Token", type="password", value=bot_state.oanda_api_token)
+bot_state.oanda_account_id = st.sidebar.text_input("OANDA Account ID (Optional)", value=bot_state.oanda_account_id)
+bot_state.oanda_api_token = st.sidebar.text_input("OANDA API Token (Optional)", type="password", value=bot_state.oanda_api_token)
 bot_state.env = st.sidebar.radio("Environment", ["Practice", "Live"], index=0 if bot_state.env=="Practice" else 1)
 bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
 
@@ -251,6 +312,9 @@ bot_state.atr_sl = st.sidebar.slider("ATR Stop Loss Multiplier", 0.5, 5.0, bot_s
 bot_state.atr_tp = st.sidebar.slider("ATR Take Profit Multiplier", 1.0, 10.0, bot_state.atr_tp, step=0.1)
 
 st.title("FX Trading Bot - USD/JPY")
+
+mode_text = "Live Trading Mode" if bot_state.oanda_account_id and bot_state.oanda_api_token else "Notification-Only Mode"
+st.write(f"**Current Mode:** {mode_text}")
 
 is_on = st.toggle("Bot Status (ON/OFF)", value=bot_state.is_running)
 bot_state.is_running = is_on
