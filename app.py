@@ -17,7 +17,7 @@ class BotState:
     def __init__(self):
         self.is_running = False
         self.webhook_url = ""
-        self.ema_period = 100
+        self.ema_period = 200
         self.rsi_buy = 60
         self.rsi_sell = 40
         self.macd_fast = 12
@@ -41,7 +41,7 @@ bot_state = get_global_state()
 @st.cache_resource
 def get_tick_history():
     # 200 is plenty for EMA 150 calculation
-    return deque(maxlen=200)
+    return deque(maxlen=250)
 
 gmo_ticks = get_tick_history()
 
@@ -225,7 +225,7 @@ st.sidebar.info("GMO Coin Public WebSocket (Ultra-Fast Tracker)")
 bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
 
 st.sidebar.header("Strategy Parameters")
-bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=150, value=bot_state.ema_period)
+bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=200, value=bot_state.ema_period)
 bot_state.rsi_buy = st.sidebar.slider("RSI Buy Max Level", 0, 100, bot_state.rsi_buy)
 bot_state.rsi_sell = st.sidebar.slider("RSI Sell Min Level", 0, 100, bot_state.rsi_sell)
 
@@ -257,7 +257,7 @@ with pcol4:
 st.markdown("---")
 
 # Dynamic Fragment for Data and Chart rendering running every 2 seconds
-@st.fragment(run_every="2s")
+@st.fragment(run_every="1s")
 def render_dynamic_dashboard():
     # Full-width colored alert box
     if "BUY" in bot_state.current_signal:
@@ -271,7 +271,7 @@ def render_dynamic_dashboard():
 
     if bot_state.df_latest is not None and not bot_state.df_latest.empty:
         # Optimization: Take only the last 100 rows for rendering
-        df_plot = bot_state.df_latest.tail(100).copy()
+        df_plot = bot_state.df_latest.tail(60).copy()
 
         # Convert time to string format to remove gaps on the x-axis
         df_plot['time_str'] = df_plot['time'].dt.strftime('%H:%M:%S')
@@ -332,7 +332,10 @@ def render_dynamic_dashboard():
             template="plotly_dark",
             height=600,
             xaxis_rangeslider_visible=False,
-            xaxis=dict(type='category', tickangle=-45) # Remove awkward time gaps
+            xaxis=dict(type='category', tickangle=-45), # Remove awkward time gaps
+            hovermode=False, # Disable hover for speed
+            uirevision='constant', # Prevent redraw flashes
+            margin=dict(l=0, r=0, t=30, b=0) # Minimalist margins
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
