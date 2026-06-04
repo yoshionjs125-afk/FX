@@ -16,7 +16,10 @@ from collections import deque
 class BotState:
     def __init__(self):
         self.is_running = False
+        self.notification_type = "Discord Webhook"
         self.webhook_url = ""
+        self.telegram_token = ""
+        self.telegram_chat_id = ""
         self.ema_period = 200
         self.rsi_buy = 60
         self.rsi_sell = 40
@@ -40,7 +43,7 @@ bot_state = get_global_state()
 # Deque for ultra-fast, memory-efficient data appending
 @st.cache_resource
 def get_tick_history():
-    # 200 is plenty for EMA 150 calculation
+    # 250 is plenty for EMA 200 calculation
     return deque(maxlen=250)
 
 gmo_ticks = get_tick_history()
@@ -48,12 +51,22 @@ gmo_ticks = get_tick_history()
 # ==========================================
 # Core Logic & Notifications
 # ==========================================
-def send_webhook(webhook_url, message):
-    if webhook_url:
+def send_notification(state, message):
+    if state.notification_type == "Discord Webhook" and state.webhook_url:
         try:
-            requests.post(webhook_url, json={"content": message})
+            requests.post(state.webhook_url, json={"content": message})
         except Exception as e:
             print(f"Webhook error: {e}")
+    elif state.notification_type == "Telegram Bot" and state.telegram_token and state.telegram_chat_id:
+        try:
+            url = f"https://api.telegram.org/bot{state.telegram_token}/sendMessage"
+            payload = {
+                "chat_id": state.telegram_chat_id,
+                "text": message
+            }
+            requests.post(url, json=payload)
+        except Exception as e:
+            print(f"Telegram error: {e}")
 
 def compute_indicators_and_signals(df, state):
     if len(df) < state.ema_period + 1:
@@ -143,7 +156,7 @@ def on_message(ws, message):
                             tp = latest['price'] + (bot_state.atr_tp * latest['ATR'])
 
                             msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
-                            send_webhook(bot_state.webhook_url, msg)
+                            send_notification(bot_state, msg)
 
                             log_entry = {
                                 "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -164,7 +177,7 @@ def on_message(ws, message):
                             tp = latest['price'] - (bot_state.atr_tp * latest['ATR'])
 
                             msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
-                            send_webhook(bot_state.webhook_url, msg)
+                            send_notification(bot_state, msg)
 
                             log_entry = {
                                 "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -222,7 +235,14 @@ st.set_page_config(page_title="FX Trading Bot Dashboard", layout="wide")
 
 st.sidebar.header("Configuration")
 st.sidebar.info("GMO Coin Public WebSocket (Ultra-Fast Tracker)")
-bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
+
+bot_state.notification_type = st.sidebar.selectbox("Notification Delivery", ["Discord Webhook", "Telegram Bot"], index=0 if bot_state.notification_type=="Discord Webhook" else 1)
+
+if bot_state.notification_type == "Discord Webhook":
+    bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
+else:
+    bot_state.telegram_token = st.sidebar.text_input("Telegram Bot Token", value=bot_state.telegram_token, type="password")
+    bot_state.telegram_chat_id = st.sidebar.text_input("Telegram Chat ID", value=bot_state.telegram_chat_id)
 
 st.sidebar.header("Strategy Parameters")
 bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=200, value=bot_state.ema_period)
