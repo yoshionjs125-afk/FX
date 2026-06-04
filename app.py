@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 import pandas_ta as ta
 import requests
 import time
@@ -43,8 +44,27 @@ bot_state = get_global_state()
 # Deque for ultra-fast, memory-efficient data appending
 @st.cache_resource
 def get_tick_history():
-    # 250 is plenty for EMA 200 calculation
-    return deque(maxlen=250)
+    dq = deque(maxlen=250)
+    # Seed historical data so chart renders immediately
+    try:
+        df_seed = yf.download("JPY=X", interval="1m", period="1d", progress=False)
+        if not df_seed.empty:
+            if isinstance(df_seed.columns, pd.MultiIndex):
+                df_seed.columns = [col[0] for col in df_seed.columns]
+            df_seed.reset_index(inplace=True)
+            for _, row in df_seed.tail(200).iterrows():
+                dq.append({
+                    'time': row['Datetime'].tz_localize(None),
+                    'open': float(row['Open']),
+                    'high': float(row['High']),
+                    'low': float(row['Low']),
+                    'close': float(row['Close']),
+                    'price': float(row['Close'])
+                })
+            print("Seeded data successfully.")
+    except Exception as e:
+        print(f"Error seeding data: {e}")
+    return dq
 
 gmo_ticks = get_tick_history()
 
