@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 import websocket
 import plotly.graph_objects as go
+from collections import deque
 
 # ==========================================
 # State Management
@@ -24,10 +25,11 @@ class BotState:
         self.macd_signal = 9
         self.atr_sl = 1.5
         self.atr_tp = 3.0
-        self.logs = []
+        self.logs = deque(maxlen=20) # Keep logs small
         self.last_trade_time = None
         self.current_signal = "⚪ [MONITORING] - Waiting for setup..."
         self.signal_expiry_time = None
+        self.df_latest = None # Pre-calculated DataFrame for the UI
 
 @st.cache_resource
 def get_global_state():
@@ -35,11 +37,11 @@ def get_global_state():
 
 bot_state = get_global_state()
 
-# Global in-memory lists for threads to share (since st.session_state is tied to sessions)
+# Deque for ultra-fast, memory-efficient data appending
 @st.cache_resource
 def get_tick_history():
-    # Store up to 200 ticks
-    return []
+    # 200 is plenty for EMA 150 calculation
+    return deque(maxlen=200)
 
 gmo_ticks = get_tick_history()
 
@@ -72,13 +74,12 @@ def compute_indicators_and_signals(df, state):
     df['BUY_SIGNAL'] = False
     df['SELL_SIGNAL'] = False
 
-    for i in range(1, len(df)):
-        prev = df.iloc[i-1]
-        curr = df.iloc[i]
+    # We only care about the very last tick for live trading
+    i = len(df) - 1
+    prev = df.iloc[i-1]
+    curr = df.iloc[i]
 
-        if pd.isna(curr['EMA']) or pd.isna(curr['ATR']) or pd.isna(curr['RSI']) or 'MACD' not in df.columns:
-            continue
-
+    if not (pd.isna(curr['EMA']) or pd.isna(curr['ATR']) or pd.isna(curr['RSI']) or 'MACD' not in df.columns):
         macd_crossed_above = prev['MACD'] <= prev['MACD_Signal'] and curr['MACD'] > curr['MACD_Signal']
         macd_crossed_below = prev['MACD'] >= prev['MACD_Signal'] and curr['MACD'] < curr['MACD_Signal']
 
@@ -96,16 +97,12 @@ def on_message(ws, message):
     try:
         data = json.loads(message)
         if "ask" in data and "bid" in data:
-            # We use the mid price
             ask = float(data["ask"])
             bid = float(data["bid"])
             mid_price = (ask + bid) / 2.0
 
-            # Timestamp from GMO or local time
             timestamp = data.get("timestamp")
             if timestamp:
-                # GMO timestamp is ISO 8601 (e.g., 2023-01-01T12:00:00.000Z)
-                # But we just use current local time for simplicity on chart
                 t_val = pd.to_datetime(timestamp).tz_localize(None)
             else:
                 t_val = datetime.now()
@@ -119,20 +116,23 @@ def on_message(ws, message):
                 'price': mid_price
             }
 
-            # We can aggregate into 5-second candles or just append ticks.
-            # Here we append ticks directly.
             gmo_ticks.append(tick_data)
 
-            if len(gmo_ticks) > 500:
-                gmo_ticks.pop(0)
+            # Reset signal if expired
+            if bot_state.signal_expiry_time and (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
+                bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+                bot_state.signal_expiry_time = None
 
-            # Signal check on new tick
-            if bot_state.is_running and len(gmo_ticks) >= bot_state.ema_period + 1:
-                df = pd.DataFrame(gmo_ticks)
+            # Process Indicators
+            if len(gmo_ticks) >= bot_state.ema_period + 1:
+                df = pd.DataFrame(list(gmo_ticks))
                 df = compute_indicators_and_signals(df, bot_state)
-                latest = df.iloc[-1]
+                bot_state.df_latest = df # Pre-calculated for UI
 
-                if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
+                # Signal Check & Action
+                if bot_state.is_running:
+                    latest = df.iloc[-1]
+
                     if latest['time'] != bot_state.last_trade_time:
                         if latest['BUY_SIGNAL']:
                             bot_state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered @ {latest['price']:.3f}!"
@@ -153,7 +153,7 @@ def on_message(ws, message):
                                 "TP": round(tp, 3),
                                 "Status": "Alert Sent"
                             }
-                            bot_state.logs.insert(0, log_entry)
+                            bot_state.logs.appendleft(log_entry) # deque appendleft
 
                         elif latest['SELL_SIGNAL']:
                             bot_state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered @ {latest['price']:.3f}!"
@@ -174,11 +174,7 @@ def on_message(ws, message):
                                 "TP": round(tp, 3),
                                 "Status": "Alert Sent"
                             }
-                            bot_state.logs.insert(0, log_entry)
-                        else:
-                            # Only reset if 10 seconds have passed since the last signal
-                            if bot_state.signal_expiry_time is None or (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
-                                bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+                            bot_state.logs.appendleft(log_entry)
 
     except Exception as e:
         print(f"WS Msg Error: {e}")
@@ -225,11 +221,11 @@ init_background_threads()
 st.set_page_config(page_title="FX Trading Bot Dashboard", layout="wide")
 
 st.sidebar.header("Configuration")
-st.sidebar.info("GMO Coin Public WebSocket (Registration-Free)")
+st.sidebar.info("GMO Coin Public WebSocket (Ultra-Fast Tracker)")
 bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
 
 st.sidebar.header("Strategy Parameters")
-bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=150, value=bot_state.ema_period) # Reduced max for ticks
+bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=150, value=bot_state.ema_period)
 bot_state.rsi_buy = st.sidebar.slider("RSI Buy Max Level", 0, 100, bot_state.rsi_buy)
 bot_state.rsi_sell = st.sidebar.slider("RSI Sell Min Level", 0, 100, bot_state.rsi_sell)
 
@@ -244,7 +240,7 @@ bot_state.atr_tp = st.sidebar.slider("ATR Take Profit Multiplier", 1.0, 10.0, bo
 
 st.title("FX Trading Bot - USD/JPY (Zero-Latency)")
 
-is_on = st.toggle("Bot Status (ON/OFF) - Start Strategy Calculations", value=bot_state.is_running)
+is_on = st.toggle("Bot Status (ON/OFF) - Allow Triggering Actions", value=bot_state.is_running)
 bot_state.is_running = is_on
 
 st.subheader("Active Parameter Dashboard")
@@ -273,13 +269,9 @@ def render_dynamic_dashboard():
 
     st.subheader("Live USD/JPY Chart")
 
-    if len(gmo_ticks) > 0:
-        # Create DataFrame from global list
-        df_plot = pd.DataFrame(list(gmo_ticks))
-
-        # Calculate indicators for chart if enough data
-        if len(df_plot) >= bot_state.ema_period + 1:
-            df_plot = compute_indicators_and_signals(df_plot, bot_state)
+    if bot_state.df_latest is not None and not bot_state.df_latest.empty:
+        # Optimization: Take only the last 100 rows for rendering
+        df_plot = bot_state.df_latest.tail(100).copy()
 
         # Convert time to string format to remove gaps on the x-axis
         df_plot['time_str'] = df_plot['time'].dt.strftime('%H:%M:%S')
@@ -308,10 +300,9 @@ def render_dynamic_dashboard():
         if 'BUY_SIGNAL' in df_plot.columns:
             buy_signals = df_plot[df_plot['BUY_SIGNAL'] == True]
             if not buy_signals.empty:
-                # Add text annotations next to the markers
                 fig.add_trace(go.Scatter(
                     x=buy_signals['time_str'],
-                    y=buy_signals['price'], # Directly on line for ticks
+                    y=buy_signals['price'],
                     mode='markers+text',
                     marker=dict(symbol='triangle-up', color='green', size=20),
                     text=["BUY"] * len(buy_signals),
@@ -320,6 +311,7 @@ def render_dynamic_dashboard():
                     name='BUY Signal'
                 ))
 
+        if 'SELL_SIGNAL' in df_plot.columns:
             sell_signals = df_plot[df_plot['SELL_SIGNAL'] == True]
             if not sell_signals.empty:
                 fig.add_trace(go.Scatter(
@@ -334,7 +326,7 @@ def render_dynamic_dashboard():
                 ))
 
         fig.update_layout(
-            title=f"GMO Coin Live Feed - {len(df_plot)} Ticks",
+            title=f"Live Feed - Showing {len(df_plot)} Ticks",
             yaxis_title="Price",
             xaxis_title="Time",
             template="plotly_dark",
@@ -347,10 +339,10 @@ def render_dynamic_dashboard():
         st.info("Connecting to GMO Coin WebSocket and waiting for data... (This may take a few seconds)")
 
     st.subheader("Recent Trade Logs")
-    log_df = pd.DataFrame(bot_state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
-    if log_df.empty:
+    if len(bot_state.logs) == 0:
         st.write("No trades yet.")
     else:
+        log_df = pd.DataFrame(list(bot_state.logs))
         st.dataframe(log_df, use_container_width=True)
 
 # Run the fragment
