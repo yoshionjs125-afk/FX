@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import pandas_ta as ta
 import requests
-import yfinance as yf
 import time
 import threading
 from datetime import datetime
+import json
+import websocket
 import plotly.graph_objects as go
 
 # ==========================================
@@ -14,12 +15,8 @@ import plotly.graph_objects as go
 class BotState:
     def __init__(self):
         self.is_running = False
-        self.oanda_account_id = ""
-        self.oanda_api_token = ""
-        self.env = "Practice"
         self.webhook_url = ""
-        self.timeframe = "1 Minute (Free Data)"
-        self.ema_period = 200
+        self.ema_period = 100
         self.rsi_buy = 60
         self.rsi_sell = 40
         self.macd_fast = 12
@@ -28,12 +25,9 @@ class BotState:
         self.atr_sl = 1.5
         self.atr_tp = 3.0
         self.logs = []
-        self.balance = "---"
-        self.positions = "---"
         self.last_trade_time = None
-        self.has_position_last_check = False
-        self.df_latest = None
         self.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+        self.signal_expiry_time = None
 
 @st.cache_resource
 def get_global_state():
@@ -41,17 +35,17 @@ def get_global_state():
 
 bot_state = get_global_state()
 
-if "tick_history" not in st.session_state:
-    st.session_state.tick_history = []
+# Global in-memory lists for threads to share (since st.session_state is tied to sessions)
+@st.cache_resource
+def get_tick_history():
+    # Store up to 200 ticks
+    return []
+
+gmo_ticks = get_tick_history()
 
 # ==========================================
-# Core Logic & API Connections
+# Core Logic & Notifications
 # ==========================================
-def get_oanda_url(env):
-    if env == "Live":
-        return "https://api-fxtrade.oanda.com/v3"
-    return "https://api-fxpractice.oanda.com/v3"
-
 def send_webhook(webhook_url, message):
     if webhook_url:
         try:
@@ -59,125 +53,12 @@ def send_webhook(webhook_url, message):
         except Exception as e:
             print(f"Webhook error: {e}")
 
-def update_account_info(state):
-    if not state.oanda_account_id or not state.oanda_api_token:
-        state.balance = "N/A (Notification Mode)"
-        state.positions = "N/A"
-        return
-    url = f"{get_oanda_url(state.env)}/accounts/{state.oanda_account_id}"
-    headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            acc = response.json().get('account', {})
-            state.balance = f"${float(acc.get('balance', 0)):.2f}"
-            state.positions = str(acc.get('openPositionCount', 0))
-    except Exception as e:
-        print(f"Error fetching account info: {e}")
-
-def fetch_data(state):
-    # Only fetch actual OANDA candlestick data here. yfinance ticks are handled in fragment.
-    if not state.oanda_account_id or not state.oanda_api_token:
-        return None
-
-    oanda_granularity = "S5" if state.timeframe == "5 Seconds (OANDA Live API Mode)" else "M1"
-
-    url = f"{get_oanda_url(state.env)}/instruments/USD_JPY/candles?count=300&price=M&granularity={oanda_granularity}"
-    headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            candles = data.get('candles', [])
-            records = []
-            for c in candles:
-                if c['complete']:
-                    records.append({
-                        'time': pd.to_datetime(c['time']),
-                        'open': float(c['mid']['o']),
-                        'high': float(c['mid']['h']),
-                        'low': float(c['mid']['l']),
-                        'close': float(c['mid']['c'])
-                    })
-            return pd.DataFrame(records)
-    except Exception as e:
-        print(f"Error fetching data from OANDA: {e}")
-    return None
-
-def check_open_positions(state):
-    if not state.oanda_account_id or not state.oanda_api_token:
-        return False
-
-    url = f"{get_oanda_url(state.env)}/accounts/{state.oanda_account_id}/positions/USD_JPY"
-    headers = {"Authorization": f"Bearer {state.oanda_api_token}"}
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            pos = response.json().get('position', {})
-            long_units = int(pos.get('long', {}).get('units', 0))
-            short_units = int(pos.get('short', {}).get('units', 0))
-            return long_units != 0 or short_units != 0
-        elif response.status_code == 404:
-            return False
-    except Exception as e:
-        print(f"Position check error: {e}")
-    return False
-
-def execute_trade(state, action, price, sl, tp, candle_time):
-    if not state.oanda_account_id or not state.oanda_api_token:
-        # Should not be reached in new logic since API checks are separate, but safe to keep
-        return
-
-    units = 10000 if action == "BUY" else -10000
-
-    order_payload = {
-        "order": {
-            "units": str(units),
-            "instrument": "USD_JPY",
-            "timeInForce": "FOK",
-            "type": "MARKET",
-            "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": f"{sl:.3f}"
-            },
-            "takeProfitOnFill": {
-                "price": f"{tp:.3f}"
-            }
-        }
-    }
-
-    url = f"{get_oanda_url(state.env)}/accounts/{state.oanda_account_id}/orders"
-    headers = {
-        "Authorization": f"Bearer {state.oanda_api_token}",
-        "Content-Type": "application/json"
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=order_payload)
-
-        log_entry = {
-            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Action": action,
-            "Price": round(price, 3),
-            "SL": round(sl, 3),
-            "TP": round(tp, 3),
-            "Status": response.status_code
-        }
-        state.logs.insert(0, log_entry)
-
-        if response.status_code == 201:
-            msg = f"EXECUTED {action} USD/JPY @ {price:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
-            send_webhook(state.webhook_url, msg)
-            state.last_trade_time = candle_time
-        else:
-            msg = f"FAILED {action} USD/JPY | Code: {response.status_code} | Msg: {response.text}"
-            send_webhook(state.webhook_url, msg)
-            print(f"Order failed: {response.text}")
-
-    except Exception as e:
-        print(f"Execution error: {e}")
-
 def compute_indicators_and_signals(df, state):
+    if len(df) < state.ema_period + 1:
+        df['BUY_SIGNAL'] = False
+        df['SELL_SIGNAL'] = False
+        return df
+
     df['EMA'] = ta.ema(df['close'], length=state.ema_period)
     macd = ta.macd(df['close'], fast=state.macd_fast, slow=state.macd_slow, signal=state.macd_signal)
     if macd is not None and not macd.empty:
@@ -185,7 +66,8 @@ def compute_indicators_and_signals(df, state):
         df['MACD_Signal'] = macd.iloc[:, 2]
 
     df['RSI'] = ta.rsi(df['close'], length=14)
-    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    # Using close for high/low proxy in tick data to compute ATR approximation
+    df['ATR'] = ta.atr(df['close'], df['close'], df['close'], length=14)
 
     df['BUY_SIGNAL'] = False
     df['SELL_SIGNAL'] = False
@@ -208,88 +90,146 @@ def compute_indicators_and_signals(df, state):
     return df
 
 # ==========================================
-# Background Loop Setup
+# WebSocket Background Daemon
 # ==========================================
-def background_loop(state):
-    while True:
-        if state.oanda_account_id and state.oanda_api_token:
-            update_account_info(state)
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+        if "ask" in data and "bid" in data:
+            # We use the mid price
+            ask = float(data["ask"])
+            bid = float(data["bid"])
+            mid_price = (ask + bid) / 2.0
 
-            has_position = check_open_positions(state)
-            if state.has_position_last_check and not has_position:
-                send_webhook(state.webhook_url, "POSITION CLOSED for USD/JPY.")
-                log_entry = {
-                    "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Action": "CLOSED",
-                    "Price": 0.0,
-                    "SL": 0.0,
-                    "TP": 0.0,
-                    "Status": "N/A"
-                }
-                state.logs.insert(0, log_entry)
+            # Timestamp from GMO or local time
+            timestamp = data.get("timestamp")
+            if timestamp:
+                # GMO timestamp is ISO 8601 (e.g., 2023-01-01T12:00:00.000Z)
+                # But we just use current local time for simplicity on chart
+                t_val = pd.to_datetime(timestamp).tz_localize(None)
+            else:
+                t_val = datetime.now()
 
-            state.has_position_last_check = has_position
+            tick_data = {
+                'time': t_val,
+                'open': mid_price,
+                'high': mid_price,
+                'low': mid_price,
+                'close': mid_price,
+                'price': mid_price
+            }
 
-            df = fetch_data(state)
-            state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+            # We can aggregate into 5-second candles or just append ticks.
+            # Here we append ticks directly.
+            gmo_ticks.append(tick_data)
 
-            if df is not None and not df.empty and len(df) >= state.ema_period + 1:
-                df['close'] = pd.to_numeric(df['close'], errors='coerce')
-                df['high'] = pd.to_numeric(df['high'], errors='coerce')
-                df['low'] = pd.to_numeric(df['low'], errors='coerce')
-                df.dropna(subset=['close', 'high', 'low'], inplace=True)
+            if len(gmo_ticks) > 500:
+                gmo_ticks.pop(0)
 
-                if len(df) >= state.ema_period + 1:
-                    df = compute_indicators_and_signals(df, state)
-                    state.df_latest = df
+            # Signal check on new tick
+            if bot_state.is_running and len(gmo_ticks) >= bot_state.ema_period + 1:
+                df = pd.DataFrame(gmo_ticks)
+                df = compute_indicators_and_signals(df, bot_state)
+                latest = df.iloc[-1]
 
-                    if state.is_running:
-                        latest = df.iloc[-1]
+                if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
+                    if latest['time'] != bot_state.last_trade_time:
+                        if latest['BUY_SIGNAL']:
+                            bot_state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered @ {latest['price']:.3f}!"
+                            bot_state.signal_expiry_time = datetime.now()
+                            bot_state.last_trade_time = latest['time']
 
-                        if not (pd.isna(latest['EMA']) or pd.isna(latest['ATR']) or pd.isna(latest['RSI'])):
-                            if latest['BUY_SIGNAL']:
-                                state.current_signal = "🟢 [SIGNAL ACTIVE] - BUY Alert Triggered!"
-                                if not has_position and latest['time'] != state.last_trade_time:
-                                    sl = latest['close'] - (state.atr_sl * latest['ATR'])
-                                    tp = latest['close'] + (state.atr_tp * latest['ATR'])
-                                    execute_trade(state, "BUY", latest['close'], sl, tp, latest['time'])
+                            sl = latest['price'] - (bot_state.atr_sl * latest['ATR'])
+                            tp = latest['price'] + (bot_state.atr_tp * latest['ATR'])
 
-                            elif latest['SELL_SIGNAL']:
-                                state.current_signal = "🔴 [SIGNAL ACTIVE] - SELL Alert Triggered!"
-                                if not has_position and latest['time'] != state.last_trade_time:
-                                    sl = latest['close'] + (state.atr_sl * latest['ATR'])
-                                    tp = latest['close'] - (state.atr_tp * latest['ATR'])
-                                    execute_trade(state, "SELL", latest['close'], sl, tp, latest['time'])
+                            msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                            send_webhook(bot_state.webhook_url, msg)
 
-        # Fast 5-second background loop for ultra-short S5 mode
-        time.sleep(5)
+                            log_entry = {
+                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Action": "SIGNAL: BUY",
+                                "Price": round(latest['price'], 3),
+                                "SL": round(sl, 3),
+                                "TP": round(tp, 3),
+                                "Status": "Alert Sent"
+                            }
+                            bot_state.logs.insert(0, log_entry)
+
+                        elif latest['SELL_SIGNAL']:
+                            bot_state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered @ {latest['price']:.3f}!"
+                            bot_state.signal_expiry_time = datetime.now()
+                            bot_state.last_trade_time = latest['time']
+
+                            sl = latest['price'] + (bot_state.atr_sl * latest['ATR'])
+                            tp = latest['price'] - (bot_state.atr_tp * latest['ATR'])
+
+                            msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                            send_webhook(bot_state.webhook_url, msg)
+
+                            log_entry = {
+                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Action": "SIGNAL: SELL",
+                                "Price": round(latest['price'], 3),
+                                "SL": round(sl, 3),
+                                "TP": round(tp, 3),
+                                "Status": "Alert Sent"
+                            }
+                            bot_state.logs.insert(0, log_entry)
+                        else:
+                            # Only reset if 10 seconds have passed since the last signal
+                            if bot_state.signal_expiry_time is None or (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
+                                bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+
+    except Exception as e:
+        print(f"WS Msg Error: {e}")
+
+def on_error(ws, error):
+    print(f"WebSocket Error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket Closed. Reconnecting...")
+    time.sleep(5)
+    start_ws()
+
+def on_open(ws):
+    print("WebSocket Opened")
+    req = {
+        "command": "subscribe",
+        "channel": "ticker",
+        "symbol": "USD_JPY"
+    }
+    ws.send(json.dumps(req))
+
+def run_ws():
+    ws = websocket.WebSocketApp("wss://api.coin.zcom.jp/ws/public/v1",
+                              on_open=on_open,
+                              on_message=on_message,
+                              on_error=on_error,
+                              on_close=on_close)
+    ws.run_forever()
+
+def start_ws():
+    wst = threading.Thread(target=run_ws, daemon=True)
+    wst.start()
 
 @st.cache_resource
-def start_background_thread():
-    state = get_global_state()
-    thread = threading.Thread(target=background_loop, args=(state,), daemon=True)
-    thread.start()
-    return thread
+def init_background_threads():
+    start_ws()
+    return True
 
-start_background_thread()
+init_background_threads()
 
 # ==========================================
 # Streamlit UI
 # ==========================================
 st.set_page_config(page_title="FX Trading Bot Dashboard", layout="wide")
 
-st.sidebar.header("API Configuration")
-bot_state.oanda_account_id = st.sidebar.text_input("OANDA Account ID (Optional)", value=bot_state.oanda_account_id)
-bot_state.oanda_api_token = st.sidebar.text_input("OANDA API Token (Optional)", type="password", value=bot_state.oanda_api_token)
-bot_state.env = st.sidebar.radio("Environment", ["Practice", "Live"], index=0 if bot_state.env=="Practice" else 1)
+st.sidebar.header("Configuration")
+st.sidebar.info("GMO Coin Public WebSocket (Registration-Free)")
 bot_state.webhook_url = st.sidebar.text_input("Webhook URL (Discord/Slack/LINE)", value=bot_state.webhook_url)
 
 st.sidebar.header("Strategy Parameters")
-timeframe_opts = ["1 Minute (Free Data)", "5 Seconds (OANDA Live API Mode)"]
-timeframe_index = 0 if bot_state.timeframe == "1 Minute (Free Data)" else 1
-bot_state.timeframe = st.sidebar.selectbox("Timeframe", timeframe_opts, index=timeframe_index)
-
-bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=50, max_value=300, value=bot_state.ema_period)
+bot_state.ema_period = st.sidebar.slider("EMA Period", min_value=10, max_value=150, value=bot_state.ema_period) # Reduced max for ticks
 bot_state.rsi_buy = st.sidebar.slider("RSI Buy Max Level", 0, 100, bot_state.rsi_buy)
 bot_state.rsi_sell = st.sidebar.slider("RSI Sell Min Level", 0, 100, bot_state.rsi_sell)
 
@@ -302,12 +242,9 @@ st.sidebar.subheader("Risk Management")
 bot_state.atr_sl = st.sidebar.slider("ATR Stop Loss Multiplier", 0.5, 5.0, bot_state.atr_sl, step=0.1)
 bot_state.atr_tp = st.sidebar.slider("ATR Take Profit Multiplier", 1.0, 10.0, bot_state.atr_tp, step=0.1)
 
-st.title("FX Trading Bot - USD/JPY")
+st.title("FX Trading Bot - USD/JPY (Zero-Latency)")
 
-mode_text = "Live Trading Mode" if bot_state.oanda_account_id and bot_state.oanda_api_token else "Notification-Only Mode"
-st.write(f"**Current Mode:** {mode_text} | **Timeframe:** {bot_state.timeframe}")
-
-is_on = st.toggle("Bot Status (ON/OFF)", value=bot_state.is_running)
+is_on = st.toggle("Bot Status (ON/OFF) - Start Strategy Calculations", value=bot_state.is_running)
 bot_state.is_running = is_on
 
 st.subheader("Active Parameter Dashboard")
@@ -323,64 +260,63 @@ with pcol4:
 
 st.markdown("---")
 
-@st.fragment(run_every="5s")
-def render_dynamic_dashboard(state):
-    # Immediate Alert Box
-    if "BUY" in state.current_signal:
-        st.success(state.current_signal)
-    elif "SELL" in state.current_signal:
-        st.error(state.current_signal)
+# Dynamic Fragment for Data and Chart rendering running every 2 seconds
+@st.fragment(run_every="2s")
+def render_dynamic_dashboard():
+    # Full-width colored alert box
+    if "BUY" in bot_state.current_signal:
+        st.success(bot_state.current_signal)
+    elif "SELL" in bot_state.current_signal:
+        st.error(bot_state.current_signal)
     else:
-        st.info(state.current_signal)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Account Balance", state.balance)
-    with col2:
-        st.metric("Active Positions", state.positions)
-    with col3:
-        st.metric("Last Update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        st.info(bot_state.current_signal)
 
     st.subheader("Live USD/JPY Chart")
 
-    if state.oanda_account_id and state.oanda_api_token:
-        # API Mode: Render High-Visibility OANDA Candlestick Chart
-        if state.df_latest is not None and not state.df_latest.empty:
-            df_plot = state.df_latest.tail(80).copy() # Limit to 80 bars for performance
+    if len(gmo_ticks) > 0:
+        # Create DataFrame from global list
+        df_plot = pd.DataFrame(list(gmo_ticks))
 
-            # Convert time to string format to remove gaps on the x-axis
-            df_plot['time_str'] = df_plot['time'].dt.strftime('%H:%M:%S')
+        # Calculate indicators for chart if enough data
+        if len(df_plot) >= bot_state.ema_period + 1:
+            df_plot = compute_indicators_and_signals(df_plot, bot_state)
 
-            fig = go.Figure()
+        # Convert time to string format to remove gaps on the x-axis
+        df_plot['time_str'] = df_plot['time'].dt.strftime('%H:%M:%S')
 
-            fig.add_trace(go.Candlestick(
+        fig = go.Figure()
+
+        # Line chart for sub-second ticks
+        fig.add_trace(go.Scatter(
+            x=df_plot['time_str'],
+            y=df_plot['price'],
+            mode='lines',
+            line=dict(color='cyan', width=2),
+            name="Spot Price"
+        ))
+
+        if 'EMA' in df_plot.columns:
+            fig.add_trace(go.Scatter(
                 x=df_plot['time_str'],
-                open=df_plot['open'],
-                high=df_plot['high'],
-                low=df_plot['low'],
-                close=df_plot['close'],
-                name="Price"
+                y=df_plot['EMA'],
+                mode='lines',
+                line=dict(color='orange', width=2),
+                name=f'{bot_state.ema_period} EMA'
             ))
 
-            if 'EMA' in df_plot.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_plot['time_str'],
-                    y=df_plot['EMA'],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=f'{state.ema_period} EMA'
-                ))
-
+        # Large Signals
+        if 'BUY_SIGNAL' in df_plot.columns:
             buy_signals = df_plot[df_plot['BUY_SIGNAL'] == True]
             if not buy_signals.empty:
+                # Add text annotations next to the markers
                 fig.add_trace(go.Scatter(
                     x=buy_signals['time_str'],
-                    y=buy_signals['low'] - (buy_signals['ATR'] * 0.5),
+                    y=buy_signals['price'], # Directly on line for ticks
                     mode='markers+text',
-                    marker=dict(symbol='triangle-up', color='green', size=18),
+                    marker=dict(symbol='triangle-up', color='green', size=20),
                     text=["BUY"] * len(buy_signals),
                     textposition="bottom center",
-                    textfont=dict(color="green", size=14),
+                    textfont=dict(color="green", size=16, weight="bold"),
                     name='BUY Signal'
                 ))
 
@@ -388,117 +324,34 @@ def render_dynamic_dashboard(state):
             if not sell_signals.empty:
                 fig.add_trace(go.Scatter(
                     x=sell_signals['time_str'],
-                    y=sell_signals['high'] + (sell_signals['ATR'] * 0.5),
+                    y=sell_signals['price'],
                     mode='markers+text',
-                    marker=dict(symbol='triangle-down', color='red', size=18),
+                    marker=dict(symbol='triangle-down', color='red', size=20),
                     text=["SELL"] * len(sell_signals),
                     textposition="top center",
-                    textfont=dict(color="red", size=14),
+                    textfont=dict(color="red", size=16, weight="bold"),
                     name='SELL Signal'
                 ))
 
-            fig.update_layout(
-                title="OANDA Live Chart",
-                yaxis_title="Price",
-                xaxis_title="Time",
-                template="plotly_dark",
-                height=600,
-                xaxis_rangeslider_visible=False,
-                xaxis=dict(type='category', tickangle=-45) # Remove awkward time gaps
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Waiting for data from OANDA...")
-
+        fig.update_layout(
+            title=f"GMO Coin Live Feed - {len(df_plot)} Ticks",
+            yaxis_title="Price",
+            xaxis_title="Time",
+            template="plotly_dark",
+            height=600,
+            xaxis_rangeslider_visible=False,
+            xaxis=dict(type='category', tickangle=-45) # Remove awkward time gaps
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        # Notification-Only Mode: Live Price Accumulator (yfinance spot)
-        try:
-            ticker = yf.Ticker("JPY=X")
-            spot = ticker.fast_info.last_price
-            current_time = datetime.now().strftime('%H:%M:%S')
-
-            # Simple mock strategy for sub-minute ticks to trigger notifications
-            st.session_state.tick_history.append({"time": current_time, "price": spot})
-
-            # Keep only the last 60 ticks (5 minutes)
-            if len(st.session_state.tick_history) > 60:
-                st.session_state.tick_history.pop(0)
-
-            df_ticks = pd.DataFrame(st.session_state.tick_history)
-
-            # Trigger logic for accumulated data (Moving Average crossover on sub-minute ticks)
-            if len(df_ticks) > 10:
-                df_ticks['SMA_Short'] = ta.sma(df_ticks['price'], length=5)
-                df_ticks['SMA_Long'] = ta.sma(df_ticks['price'], length=10)
-
-                latest = df_ticks.iloc[-1]
-                prev = df_ticks.iloc[-2]
-
-                state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
-
-                if not pd.isna(latest['SMA_Long']):
-                    if prev['SMA_Short'] <= prev['SMA_Long'] and latest['SMA_Short'] > latest['SMA_Long']:
-                        state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered at {latest['price']:.3f}!"
-                        if state.is_running and latest['time'] != state.last_trade_time:
-                            msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f}"
-                            send_webhook(state.webhook_url, msg)
-
-                            log_entry = {
-                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Action": "SIGNAL: BUY",
-                                "Price": round(latest['price'], 3),
-                                "SL": "---",
-                                "TP": "---",
-                                "Status": "Alert Sent"
-                            }
-                            state.logs.insert(0, log_entry)
-                            state.last_trade_time = latest['time']
-
-                    elif prev['SMA_Short'] >= prev['SMA_Long'] and latest['SMA_Short'] < latest['SMA_Long']:
-                        state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered at {latest['price']:.3f}!"
-                        if state.is_running and latest['time'] != state.last_trade_time:
-                            msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f}"
-                            send_webhook(state.webhook_url, msg)
-
-                            log_entry = {
-                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Action": "SIGNAL: SELL",
-                                "Price": round(latest['price'], 3),
-                                "SL": "---",
-                                "TP": "---",
-                                "Status": "Alert Sent"
-                            }
-                            state.logs.insert(0, log_entry)
-                            state.last_trade_time = latest['time']
-
-            # Render the Smooth Line Chart
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df_ticks['time'],
-                y=df_ticks['price'],
-                mode='lines+markers',
-                line=dict(color='cyan', width=2),
-                name="Live USD/JPY"
-            ))
-
-            fig.update_layout(
-                title="Live Tick Chart (Notification Mode)",
-                yaxis_title="Price",
-                xaxis_title="Time",
-                template="plotly_dark",
-                height=600,
-                xaxis_rangeslider_visible=False
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Error fetching live tick: {e}")
+        st.info("Connecting to GMO Coin WebSocket and waiting for data... (This may take a few seconds)")
 
     st.subheader("Recent Trade Logs")
-    log_df = pd.DataFrame(state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
+    log_df = pd.DataFrame(bot_state.logs, columns=["Time", "Action", "Price", "SL", "TP", "Status"])
     if log_df.empty:
         st.write("No trades yet.")
     else:
         st.dataframe(log_df, use_container_width=True)
 
-render_dynamic_dashboard(bot_state)
+# Run the fragment
+render_dynamic_dashboard()
