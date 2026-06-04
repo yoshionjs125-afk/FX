@@ -9,6 +9,14 @@ import json
 import websocket
 import plotly.graph_objects as go
 from collections import deque
+import yfinance as yf
+
+# Global Lock for thread-safety
+@st.cache_resource
+def get_lock():
+    return threading.Lock()
+
+data_lock = get_lock()
 
 # ==========================================
 # State Management
@@ -17,6 +25,7 @@ class BotState:
     def __init__(self):
         self.is_running = False
         self.webhook_url = ""
+        self.last_tick_time = 0.0
         self.ema_period = 200
         self.rsi_buy = 60
         self.rsi_sell = 40
@@ -44,6 +53,30 @@ def get_tick_history():
     return deque(maxlen=250)
 
 gmo_ticks = get_tick_history()
+
+def initialize_yfinance_history():
+    with data_lock:
+        if len(gmo_ticks) == 0:
+            print("Fetching yfinance fallback history for initial instant render...")
+            try:
+                tkr = yf.Ticker("JPY=X")
+                hist = tkr.history(period="1d", interval="1m").tail(60) # Fetch last 60 minutes
+                for index, row in hist.iterrows():
+                    tick_data = {
+                        'time': index.tz_localize(None),
+                        'open': row['Open'],
+                        'high': row['High'],
+                        'low': row['Low'],
+                        'close': row['Close'],
+                        'price': row['Close']
+                    }
+                    gmo_ticks.append(tick_data)
+                bot_state.last_tick_time = time.time()
+                print(f"Loaded {len(gmo_ticks)} historical ticks from yfinance.")
+            except Exception as e:
+                print(f"Failed to fetch yfinance history: {e}")
+
+initialize_yfinance_history()
 
 # ==========================================
 # Core Logic & Notifications
@@ -90,6 +123,69 @@ def compute_indicators_and_signals(df, state):
 
     return df
 
+def process_new_tick(tick_data):
+    with data_lock:
+        bot_state.last_tick_time = time.time()
+        gmo_ticks.append(tick_data)
+
+        # Reset signal if expired
+        if bot_state.signal_expiry_time and (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
+            bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+            bot_state.signal_expiry_time = None
+
+        # Process Indicators
+        if len(gmo_ticks) >= bot_state.ema_period + 1:
+            df = pd.DataFrame(list(gmo_ticks))
+            df = compute_indicators_and_signals(df, bot_state)
+            bot_state.df_latest = df # Pre-calculated for UI
+
+            # Signal Check & Action
+            if bot_state.is_running:
+                latest = df.iloc[-1]
+
+                if latest['time'] != bot_state.last_trade_time:
+                    if latest['BUY_SIGNAL']:
+                        bot_state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered @ {latest['price']:.3f}!"
+                        bot_state.signal_expiry_time = datetime.now()
+                        bot_state.last_trade_time = latest['time']
+
+                        sl = latest['price'] - (bot_state.atr_sl * latest['ATR'])
+                        tp = latest['price'] + (bot_state.atr_tp * latest['ATR'])
+
+                        msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                        send_webhook(bot_state.webhook_url, msg)
+
+                        log_entry = {
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Action": "SIGNAL: BUY",
+                            "Price": round(latest['price'], 3),
+                            "SL": round(sl, 3),
+                            "TP": round(tp, 3),
+                            "Status": "Alert Sent"
+                        }
+                        bot_state.logs.appendleft(log_entry)
+
+                    elif latest['SELL_SIGNAL']:
+                        bot_state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered @ {latest['price']:.3f}!"
+                        bot_state.signal_expiry_time = datetime.now()
+                        bot_state.last_trade_time = latest['time']
+
+                        sl = latest['price'] + (bot_state.atr_sl * latest['ATR'])
+                        tp = latest['price'] - (bot_state.atr_tp * latest['ATR'])
+
+                        msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                        send_webhook(bot_state.webhook_url, msg)
+
+                        log_entry = {
+                            "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Action": "SIGNAL: SELL",
+                            "Price": round(latest['price'], 3),
+                            "SL": round(sl, 3),
+                            "TP": round(tp, 3),
+                            "Status": "Alert Sent"
+                        }
+                        bot_state.logs.appendleft(log_entry)
+
 # ==========================================
 # WebSocket Background Daemon
 # ==========================================
@@ -116,65 +212,7 @@ def on_message(ws, message):
                 'price': mid_price
             }
 
-            gmo_ticks.append(tick_data)
-
-            # Reset signal if expired
-            if bot_state.signal_expiry_time and (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
-                bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
-                bot_state.signal_expiry_time = None
-
-            # Process Indicators
-            if len(gmo_ticks) >= bot_state.ema_period + 1:
-                df = pd.DataFrame(list(gmo_ticks))
-                df = compute_indicators_and_signals(df, bot_state)
-                bot_state.df_latest = df # Pre-calculated for UI
-
-                # Signal Check & Action
-                if bot_state.is_running:
-                    latest = df.iloc[-1]
-
-                    if latest['time'] != bot_state.last_trade_time:
-                        if latest['BUY_SIGNAL']:
-                            bot_state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered @ {latest['price']:.3f}!"
-                            bot_state.signal_expiry_time = datetime.now()
-                            bot_state.last_trade_time = latest['time']
-
-                            sl = latest['price'] - (bot_state.atr_sl * latest['ATR'])
-                            tp = latest['price'] + (bot_state.atr_tp * latest['ATR'])
-
-                            msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
-                            send_webhook(bot_state.webhook_url, msg)
-
-                            log_entry = {
-                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Action": "SIGNAL: BUY",
-                                "Price": round(latest['price'], 3),
-                                "SL": round(sl, 3),
-                                "TP": round(tp, 3),
-                                "Status": "Alert Sent"
-                            }
-                            bot_state.logs.appendleft(log_entry) # deque appendleft
-
-                        elif latest['SELL_SIGNAL']:
-                            bot_state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered @ {latest['price']:.3f}!"
-                            bot_state.signal_expiry_time = datetime.now()
-                            bot_state.last_trade_time = latest['time']
-
-                            sl = latest['price'] + (bot_state.atr_sl * latest['ATR'])
-                            tp = latest['price'] - (bot_state.atr_tp * latest['ATR'])
-
-                            msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
-                            send_webhook(bot_state.webhook_url, msg)
-
-                            log_entry = {
-                                "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "Action": "SIGNAL: SELL",
-                                "Price": round(latest['price'], 3),
-                                "SL": round(sl, 3),
-                                "TP": round(tp, 3),
-                                "Status": "Alert Sent"
-                            }
-                            bot_state.logs.appendleft(log_entry)
+            process_new_tick(tick_data)
 
     except Exception as e:
         print(f"WS Msg Error: {e}")
@@ -208,9 +246,104 @@ def start_ws():
     wst = threading.Thread(target=run_ws, daemon=True)
     wst.start()
 
+def run_fallback_monitor():
+    in_fallback = False
+    while True:
+        time.sleep(1)
+        # Check if we haven't received a tick in 3 seconds
+        if time.time() - bot_state.last_tick_time > 3 or in_fallback:
+            in_fallback = True
+            try:
+                tkr = yf.Ticker("JPY=X")
+                # fast_info.last_price is very fast
+                price = tkr.fast_info.last_price
+                t_val = datetime.now()
+                tick_data = {
+                    'time': t_val,
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'price': price
+                }
+                print(f"[Fallback] Fetched yfinance spot: {price}")
+                # Use a specific fallback process to avoid resetting the last_tick_time
+                with data_lock:
+                    gmo_ticks.append(tick_data)
+
+                    # Reset signal if expired
+                    if bot_state.signal_expiry_time and (datetime.now() - bot_state.signal_expiry_time).total_seconds() > 10:
+                        bot_state.current_signal = "⚪ [MONITORING] - Waiting for setup..."
+                        bot_state.signal_expiry_time = None
+
+                    # Process Indicators
+                    if len(gmo_ticks) >= bot_state.ema_period + 1:
+                        df = pd.DataFrame(list(gmo_ticks))
+                        df = compute_indicators_and_signals(df, bot_state)
+                        bot_state.df_latest = df # Pre-calculated for UI
+
+                        # Signal Check & Action
+                        if bot_state.is_running:
+                            latest = df.iloc[-1]
+
+                            if latest['time'] != bot_state.last_trade_time:
+                                if latest['BUY_SIGNAL']:
+                                    bot_state.current_signal = f"🟢 [SIGNAL ACTIVE] - BUY Alert Triggered @ {latest['price']:.3f}!"
+                                    bot_state.signal_expiry_time = datetime.now()
+                                    bot_state.last_trade_time = latest['time']
+
+                                    sl = latest['price'] - (bot_state.atr_sl * latest['ATR'])
+                                    tp = latest['price'] + (bot_state.atr_tp * latest['ATR'])
+
+                                    msg = f"🔥 [SIGNAL ALERT] USD/JPY BUY Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                                    send_webhook(bot_state.webhook_url, msg)
+
+                                    log_entry = {
+                                        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "Action": "SIGNAL: BUY",
+                                        "Price": round(latest['price'], 3),
+                                        "SL": round(sl, 3),
+                                        "TP": round(tp, 3),
+                                        "Status": "Alert Sent"
+                                    }
+                                    bot_state.logs.appendleft(log_entry)
+
+                                elif latest['SELL_SIGNAL']:
+                                    bot_state.current_signal = f"🔴 [SIGNAL ACTIVE] - SELL Alert Triggered @ {latest['price']:.3f}!"
+                                    bot_state.signal_expiry_time = datetime.now()
+                                    bot_state.last_trade_time = latest['time']
+
+                                    sl = latest['price'] + (bot_state.atr_sl * latest['ATR'])
+                                    tp = latest['price'] - (bot_state.atr_tp * latest['ATR'])
+
+                                    msg = f"🔥 [SIGNAL ALERT] USD/JPY SELL Signal triggered at {latest['price']:.3f} | SL: {sl:.3f} | TP: {tp:.3f}"
+                                    send_webhook(bot_state.webhook_url, msg)
+
+                                    log_entry = {
+                                        "Time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "Action": "SIGNAL: SELL",
+                                        "Price": round(latest['price'], 3),
+                                        "SL": round(sl, 3),
+                                        "TP": round(tp, 3),
+                                        "Status": "Alert Sent"
+                                    }
+                                    bot_state.logs.appendleft(log_entry)
+
+            except Exception as e:
+                print(f"[Fallback Error] Failed to fetch yfinance data: {e}")
+
+        # If the last_tick_time indicates fresh WS data, we leave fallback mode
+        if time.time() - bot_state.last_tick_time < 3:
+            in_fallback = False
+
+def start_fallback_monitor():
+    fmt = threading.Thread(target=run_fallback_monitor, daemon=True)
+    fmt.start()
+
 @st.cache_resource
 def init_background_threads():
     start_ws()
+    start_fallback_monitor()
     return True
 
 init_background_threads()
@@ -269,10 +402,13 @@ def render_dynamic_dashboard():
 
     st.subheader("Live USD/JPY Chart")
 
-    if bot_state.df_latest is not None and not bot_state.df_latest.empty:
-        # Optimization: Take only the last 100 rows for rendering
-        df_plot = bot_state.df_latest.tail(60).copy()
+    df_plot = None
+    with data_lock:
+        if bot_state.df_latest is not None and not bot_state.df_latest.empty:
+            # Optimization: Take only the last 100 rows for rendering
+            df_plot = bot_state.df_latest.tail(60).copy()
 
+    if df_plot is not None and not df_plot.empty:
         # Convert time to string format to remove gaps on the x-axis
         df_plot['time_str'] = df_plot['time'].dt.strftime('%H:%M:%S')
 
@@ -342,10 +478,14 @@ def render_dynamic_dashboard():
         st.info("Connecting to GMO Coin WebSocket and waiting for data... (This may take a few seconds)")
 
     st.subheader("Recent Trade Logs")
-    if len(bot_state.logs) == 0:
+    logs_copy = []
+    with data_lock:
+        logs_copy = list(bot_state.logs)
+
+    if len(logs_copy) == 0:
         st.write("No trades yet.")
     else:
-        log_df = pd.DataFrame(list(bot_state.logs))
+        log_df = pd.DataFrame(logs_copy)
         st.dataframe(log_df, use_container_width=True)
 
 # Run the fragment
