@@ -47,12 +47,13 @@ def get_tick_history():
     dq = deque(maxlen=250)
     # Seed historical data so chart renders immediately
     try:
-        df_seed = yf.download("JPY=X", interval="1m", period="1d", progress=False)
+        # Fetch 5 days of data to guarantee we get at least 250 rows even on weekends/holidays
+        df_seed = yf.download("JPY=X", interval="1m", period="5d", progress=False)
         if not df_seed.empty:
             if isinstance(df_seed.columns, pd.MultiIndex):
                 df_seed.columns = [col[0] for col in df_seed.columns]
             df_seed.reset_index(inplace=True)
-            for _, row in df_seed.tail(200).iterrows():
+            for _, row in df_seed.tail(250).iterrows():
                 dq.append({
                     'time': row['Datetime'].tz_localize(None),
                     'open': float(row['Open']),
@@ -61,7 +62,13 @@ def get_tick_history():
                     'close': float(row['Close']),
                     'price': float(row['Close'])
                 })
-            print("Seeded data successfully.")
+            print(f"Seeded {len(dq)} ticks successfully.")
+
+            # Immediately pre-calculate df_latest so the UI doesn't wait for the first WS tick
+            if len(dq) >= bot_state.ema_period + 1:
+                df = pd.DataFrame(list(dq))
+                bot_state.df_latest = compute_indicators_and_signals(df, bot_state)
+
     except Exception as e:
         print(f"Error seeding data: {e}")
     return dq
